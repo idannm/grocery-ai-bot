@@ -2,7 +2,7 @@ import streamlit as st
 from groq import Groq
 import psycopg2
 import requests
-
+import json
 # הגדרות מפתחות מהכספת (Secrets)
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 DB_URL = st.secrets["DB_URL"]
@@ -62,23 +62,31 @@ query_params = st.query_params
 if "message" in query_params:
     incoming_msg = query_params["message"]
     
-    # כאן אנחנו מריצים את ה-AI בדיוק כמו בצא'ט
-    inventory_data = get_inventory()
-    system_msg = f"אתה עוזר במכולת שכונתית וחברית. המלאי שלך:\n{inventory_data}\n"
-    system_msg += "הוראות: אל תהיה רשמי! השתמש בשמות חיבה. בקש שם, כתובת וטלפון בסוף."
-    
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": incoming_msg}
-            ]
-        )
-        ai_reply = response.choices[0].message.content
-        # זה מה ש-Make יקרא:
-        st.write("--- RESPONSE FOR MAKE ---")
-        st.write(ai_reply)
-        st.stop() # עוצר את שאר הדף כדי ש-Make יקבל רק את התשובה
-    except Exception as e:
-        st.write(f"Error: {e}")
+ # פונקציה לבדיקה אם מגיעה הודעה מ-Make
+def handle_make_request():
+    # ב-Streamlit, הדרך הכי טובה לקבל POST היא דרך רכיב שמחכה לנתונים
+    # אבל כרגע, בוא נשתמש בפרמטר פשוט ב-URL שמוביל לתצוגה נקייה
+    query_params = st.query_params
+    if "message" in query_params:
+        user_msg = query_params["message"]
+        
+        inventory_data = get_inventory()
+        system_msg = f"אתה עוזר במכולת. מלאי:\n{inventory_data}"
+        
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg}
+                ]
+            )
+            ai_reply = response.choices[0].message.content
+            # אנחנו נדפיס רק את התשובה כדי ש-Make יוכל "לדוג" אותה
+            st.write(f"START_REPLY{ai_reply}END_REPLY")
+            st.stop()
+        except Exception as e:
+            st.write(f"Error: {e}")
+            st.stop()
+
+handle_make_request()
