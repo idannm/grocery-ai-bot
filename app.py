@@ -1,107 +1,58 @@
 import streamlit as st
-import psycopg2
-import pandas as pd
 from groq import Groq
+import psycopg2
+import requests
 
-# --- הגדרות ---
-# שים לב לעדכן את המפתחות שלך כאן!
-# במקום לשים את המפתח האמיתי, אנחנו כותבים את זה ככה:
+# הגדרות מפתחות מהכספת (Secrets)
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 DB_URL = st.secrets["DB_URL"]
-ADMIN_PASSWORD = "1234" 
+MAKE_WEBHOOK_URL = st.secrets.get("MAKE_WEBHOOK_URL", "") # נוסיף את זה בהמשך ל-Secrets
 
 client = Groq(api_key=GROQ_API_KEY)
 
-# --- פונקציות עזר ---
-def get_db_connection():
-    return psycopg2.connect(DB_URL)
-
-def get_inventory():
+# פונקציה לשמירת הזמנה ב-Neon
+def save_order_to_db(customer_name, order_text):
     try:
-        conn = get_db_connection()
-        query = "SELECT DISTINCT ON (name) name, price, stock FROM products ORDER BY name, id DESC"
-        df = pd.read_sql_query(query, conn)
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO orders (customer_name, order_content) VALUES (%s, %s)", (customer_name, order_text))
+        conn.commit()
+        cur.close()
         conn.close()
-        return df.to_string(index=False)
     except Exception as e:
-        return f"המלאי לא זמין כרגע: {e}"
+        st.error(f"Error saving to DB: {e}")
 
-# --- הגדרות דף ---
-st.set_page_config(page_title="המכולת החכמה", layout="wide")
+# פונקציה ששולחת את התשובה חזרה לוואטסאפ דרך Make
+def send_to_whatsapp(message, customer_number):
+    if MAKE_WEBHOOK_URL:
+        data = {"message": message, "number": customer_number}
+        requests.post(MAKE_WEBHOOK_URL, json=data)
 
-# ניהול זיכרון השיחה
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+st.title("🛒 בוט ההזמנות שלי - ניהול וואטסאפ")
 
-# --- תפריט צד (ניהול) ---
-with st.sidebar:
-    st.title("🛠️ לוח בקרה")
-    show_admin = st.checkbox("כניסת מנהל")
-    if show_admin:
-        pwd = st.text_input("סיסמה", type="password")
-        if pwd == ADMIN_PASSWORD:
-            st.success("מחובר כמנהל")
-            admin_tab = st.radio("פעולות:", ["עריכת מוצרים", "הגדרות"])
-            
-            if admin_tab == "עריכת מוצרים":
-                try:
-                    conn = get_db_connection()
-                    df = pd.read_sql_query("SELECT * FROM products ORDER BY id", conn)
-                    edited_df = st.data_editor(df, num_rows="dynamic", key="data_editor")
-                    if st.button("שמור שינויים"):
-                        cur = conn.cursor()
-                        for _, row in edited_df.iterrows():
-                            cur.execute("UPDATE products SET name=%s, price=%s, stock=%s WHERE id=%s", 
-                                       (row['name'], row['price'], row['stock'], row['id']))
-                        conn.commit()
-                        cur.close()
-                        st.success("המחסן עודכן!")
-                    conn.close()
-                except Exception as e:
-                    st.error(f"שגיאה בגישה לבסיס הנתונים: {e}")
-        else:
-            st.info("הכנס סיסמה כדי לראות הגדרות")
+# ממשק בדיקה באתר (כדי שתוכל להראות ללקוחות גם פה)
+user_input = st.text_input("נסה את הבוט (כמו לקוח בוואטסאפ):")
 
-# --- גוף האפליקציה (צ'אט לקוחות) ---
-st.title("🛒 המכולת של החבר'ה")
+if user_input:
+    # שליחת השאלה ל-AI
+    completion = client.chat.completions.create(
+        model="llama3-8b-8192",
+        messages=[{"role": "system", "content": "אתה עוזר חכם לחנות מכולת. תענה קצר ולעניין. אם הלקוח סיים להזמין, תגיד 'ההזמנה נשמרה'."},
+                  {"role": "user", "content": user_input}]
+    )
+    
+    response = completion.choices[0].message.content
+    st.write(f"**הבוט עונה:** {response}")
+    
+    # אם הבוט זיהה סיום הזמנה - שומרים ל-DB
+    if "נשמרה" in response:
+        save_order_to_db("לקוח וואטסאפ", user_input)
+        st.success("ההזמנה נרשמה במערכת!")
 
-# הצגת היסטוריית השיחה
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# קלט מהלקוח
-if prompt := st.chat_input("אהלן! מה אפשר להביא לך היום?"):
-    # הוספת הודעת המשתמש לזיכרון
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # יצירת תשובת הבוט
-    with st.chat_message("assistant"):
-        inventory_data = get_inventory()
-        
-        # בניית ה-Prompt בצורה בטוחה
-        system_msg = f"אתה עוזר במכולת שכונתית וחברית. המלאי שלך:\n{inventory_data}\n\n"
-        system_msg += "הוראות: אל תהיה רשמי! אל תגיד 'אדוני'. השתמש בשמות חיבה כמו 'צדיק', 'נשמה', 'אלוף'. "
-        system_msg += "לפני סגירת הזמנה, חובה לבקש: שם מלא, כתובת וטלפון. אל תאשר בלי זה."
-
-        # הכנת ההיסטוריה לשליחה ל-AI
-        full_history = [{"role": "system", "content": system_msg}] + st.session_state.messages
-
-        try:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=full_history
-            )
-            
-            ai_answer = response.choices[0].message.content
-            st.markdown(ai_answer)
-            st.session_state.messages.append({"role": "assistant", "content": ai_answer})
-        except Exception as e:
-            st.error(f"שגיאה בתקשורת עם ה-AI: {e}")
-
-# כפתור איפוס שיחה בתפריט הצד
-if st.sidebar.button("🗑️ נקה שיחה"):
-    st.session_state.messages = []
-    st.rerun()
+# --- לוגיקה לקבלת הודעות מוואטסאפ (דרך URL) ---
+# הערה: כשנחבר את Make, הם ישלחו לכאן בקשות HTTP
+query_params = st.query_params
+if "whatsapp_msg" in query_params:
+    msg = query_params["whatsapp_msg"]
+    sender = query_params.get("sender", "unknown")
+    # כאן אפשר להוסיף לוגיקה שתעבד אוטומטית הודעות נכנסות
