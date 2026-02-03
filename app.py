@@ -1,19 +1,32 @@
 import streamlit as st
 from groq import Groq
 import psycopg2
+import pandas as pd
 import requests
-import json
-# הגדרות מפתחות מהכספת (Secrets)
+
+# --- הגדרות מהכספת ---
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 DB_URL = st.secrets["DB_URL"]
-MAKE_WEBHOOK_URL = st.secrets.get("MAKE_WEBHOOK_URL", "") # נוסיף את זה בהמשך ל-Secrets
 
 client = Groq(api_key=GROQ_API_KEY)
 
-# פונקציה לשמירת הזמנה ב-Neon
+# --- פונקציות עזר ---
+def get_db_connection():
+    return psycopg2.connect(DB_URL)
+
+def get_inventory():
+    try:
+        conn = get_db_connection()
+        query = "SELECT DISTINCT ON (name) name, price, stock FROM products ORDER BY name, id DESC"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df.to_string(index=False)
+    except Exception as e:
+        return "המלאי לא זמין כרגע."
+
 def save_order_to_db(customer_name, order_text):
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("INSERT INTO orders (customer_name, order_content) VALUES (%s, %s)", (customer_name, order_text))
         conn.commit()
@@ -22,71 +35,45 @@ def save_order_to_db(customer_name, order_text):
     except Exception as e:
         st.error(f"Error saving to DB: {e}")
 
-# פונקציה ששולחת את התשובה חזרה לוואטסאפ דרך Make
-def send_to_whatsapp(message, customer_number):
-    if MAKE_WEBHOOK_URL:
-        data = {"message": message, "number": customer_number}
-        requests.post(MAKE_WEBHOOK_URL, json=data)
+# --- לוגיקה עבור Make.com (חייב להופיע לפני ה-UI) ---
+if "message" in st.query_params:
+    user_msg = st.query_params["message"]
+    inventory_data = get_inventory()
+    
+    system_msg = f"אתה עוזר במכולת שכונתית וחברית. המלאי שלך:\n{inventory_data}\n"
+    system_msg += "הוראות: אל תהיה רשמי! השתמש בשמות חיבה כמו 'צדיק'. בסוף הזמנה בקש שם וכתובת."
+    
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg}
+            ]
+        )
+        ai_reply = completion.choices[0].message.content
+        
+        # אם הבוט זיהה סיום הזמנה - שומרים ל-DB
+        if "נשמרה" in ai_reply or "הזמנה בוצעה" in ai_reply:
+             save_order_to_db("לקוח וואטסאפ", user_msg)
 
-st.title("🛒 בוט ההזמנות שלי - ניהול וואטסאפ")
+        # פלט נקי עבור Make
+        st.write(ai_reply)
+        st.stop() # חשוב! עוצר את הטעינה של שאר האתר
+    except Exception as e:
+        st.write(f"Error: {e}")
+        st.stop()
 
-# ממשק בדיקה באתר (כדי שתוכל להראות ללקוחות גם פה)
-user_input = st.text_input("נסה את הבוט (כמו לקוח בוואטסאפ):")
+# --- ממשק האתר (מה שרואים בדפדפן) ---
+st.title("🛒 המכולת החכמה - ניהול ובדיקה")
+user_input = st.text_input("בדיקת צ'אט (כמו לקוח):")
 
 if user_input:
-    # שליחת השאלה ל-AI
+    inventory_data = get_inventory()
     completion = client.chat.completions.create(
         model="llama3-8b-8192",
-        messages=[{"role": "system", "content": "אתה עוזר חכם לחנות מכולת. תענה קצר ולעניין. אם הלקוח סיים להזמין, תגיד 'ההזמנה נשמרה'."},
+        messages=[{"role": "system", "content": f"עוזר במכולת. מלאי:\n{inventory_data}"},
                   {"role": "user", "content": user_input}]
     )
-    
     response = completion.choices[0].message.content
-    st.write(f"**הבוט עונה:** {response}")
-    
-    # אם הבוט זיהה סיום הזמנה - שומרים ל-DB
-    if "נשמרה" in response:
-        save_order_to_db("לקוח וואטסאפ", user_input)
-        st.success("ההזמנה נרשמה במערכת!")
-
-# --- לוגיקה לקבלת הודעות מוואטסאפ (דרך URL) ---
-# הערה: כשנחבר את Make, הם ישלחו לכאן בקשות HTTP
-query_params = st.query_params
-if "whatsapp_msg" in query_params:
-    msg = query_params["whatsapp_msg"]
-    sender = query_params.get("sender", "unknown")
-    # כאן אפשר להוסיף לוגיקה שתעבד אוטומטית הודעות נכנסות
-# --- הוספה עבור חיבור ל-Make.com ---
-# הקוד הזה בודק אם שלחו הודעה בקישור (למשל ?message=היי)
-query_params = st.query_params
-if "message" in query_params:
-    incoming_msg = query_params["message"]
-    
- # פונקציה לבדיקה אם מגיעה הודעה מ-Make
-def handle_make_request():
-    # ב-Streamlit, הדרך הכי טובה לקבל POST היא דרך רכיב שמחכה לנתונים
-    # אבל כרגע, בוא נשתמש בפרמטר פשוט ב-URL שמוביל לתצוגה נקייה
-    query_params = st.query_params
-    if "message" in query_params:
-        user_msg = query_params["message"]
-        
-        inventory_data = get_inventory()
-        system_msg = f"אתה עוזר במכולת. מלאי:\n{inventory_data}"
-        
-        try:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg}
-                ]
-            )
-            ai_reply = response.choices[0].message.content
-            # אנחנו נדפיס רק את התשובה כדי ש-Make יוכל "לדוג" אותה
-            st.write(f"START_REPLY{ai_reply}END_REPLY")
-            st.stop()
-        except Exception as e:
-            st.write(f"Error: {e}")
-            st.stop()
-
-handle_make_request()
+    st.write(f"**הבוט:** {response}")
